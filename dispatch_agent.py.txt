@@ -1,0 +1,772 @@
+# dispatch_agent.py  —  The Dispatcher Qt  |  Persistent Resolve Mediator
+# =============================================================================
+# АРХИТЕКТУРА: ОДИН постоянный процесс на всё время сессии.
+#
+# Resolve привязывается к первому подключившемуся медиатору и не принимает
+# команды от других процессов. Поэтому медиатор:
+#   1. Запускается при открытии проекта (или старте приложения)
+#   2. Держит постоянное соединение с Resolve
+#   3. Слушает JSON-команды из stdin в бесконечном цикле
+#   4. Отвечает JSON в stdout
+#   5. Останавливается только при команде QUIT или закрытии проекта
+#
+# Протокол stdin → команды JSON:
+#   {"cmd": "get_presets"}
+#   {"cmd": "sync", "auto_count": 0, "color": "All"}
+#   {"cmd": "render", "name": "Seg_1", "start": 0, "end": 1000,
+#            "preset": "H.264", "output": "C:/renders", "audio_only": 0}
+#   {"cmd": "stop"}          ← StopRendering() в Resolve
+#   {"cmd": "pause"}
+#   {"cmd": "resume"}
+#   {"cmd": "list_jobs"}
+#   {"cmd": "open_project", "path": "C:/x.drp", "name": "x"}
+#   {"cmd": "close_project"}
+#   {"cmd": "final_build", "preset": "...", "output": "...", "segments": [...]}
+#   {"cmd": "quit"}          ← завершить медиатор
+# =============================================================================
+
+import sys, os, json, time, threading, argparse
+
+# ── Resolve API path ──────────────────────────────────────────────────────────
+def _setup_resolve_path():
+    candidates = [
+        r"C:\ProgramData\Blackmagic Design\DaVinci Resolve\Support\Developer\Scripting\Modules",
+        "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules",
+        "/opt/resolve/libs/Fusion/",
+    ]
+    env = os.environ.get("RESOLVE_SCRIPT_API", "")
+    if env:
+        candidates.insert(0, os.path.join(env, "Modules"))
+    for p in candidates:
+        if p and os.path.isdir(p) and p not in sys.path:
+            sys.path.append(p)
+    for d in [r"C:\Program Files\Blackmagic Design\DaVinci Resolve",
+              r"C:\Program Files (x86)\Blackmagic Design\DaVinci Resolve"]:
+        if os.path.isdir(d) and d not in sys.path:
+            sys.path.append(d)
+
+_setup_resolve_path()
+
+# ── Output (потокобезопасный) ─────────────────────────────────────────────────
+_out_lock = threading.Lock()
+
+def emit(msg_type, **kwargs):
+    data = {"type": msg_type}
+    data.update(kwargs)
+    with _out_lock:
+        sys.stdout.write(json.dumps(data, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
+
+def log(text, level="info"):
+    emit("log", text=str(text), level=level)
+
+def safe_name(s):
+    import re
+    return re.sub(r'[\\/:*?"<>|]', '_', str(s)).strip()
+
+# =============================================================================
+# ResolveMediator — постоянное соединение с Resolve
+# =============================================================================
+class ResolveMediator(object):
+    def __init__(self):
+        self.api      = None
+        self.pm       = None
+        self.project  = None
+        self._lock    = threading.Lock()
+        self._rendering = False
+        self._current_job_id = None
+
+    def connect(self, ip="127.0.0.1"):
+        try:
+            import DaVinciResolveScript as dvr
+        except ImportError as e:
+            emit("error", text="DaVinciResolveScript не найден: " + str(e))
+            return False
+        try:
+            self.api = dvr.scriptapp("Resolve", ip)
+            if not self.api:
+                emit("error", text="Resolve вернул None. Запущен ли Resolve? "
+                     "Preferences→General→External scripting→Network")
+                return False
+            self.pm = self.api.GetProjectManager()
+            if not self.pm:
+                emit("error", text="GetProjectManager вернул None")
+                return False
+            self.project = self.pm.GetCurrentProject()
+            if not self.project:
+                # Не ошибка — проект просто не открыт ещё
+                log("Resolve подключён, проект не открыт.", "ok")
+            else:
+                name = ""
+                try: name = self.project.GetName()
+                except: pass
+                log("Resolve Mediator: OK (project={})".format(name), "ok")
+            emit("connected", ip=ip)
+            return True
+        except Exception as e:
+            emit("error", text="Ошибка соединения: " + str(e))
+            return False
+
+    def ping(self):
+        """Проверяет соединение с Resolve."""
+        try:
+            if self.project:
+                self.project.GetName()
+                return True
+            if self.pm:
+                self.project = self.pm.GetCurrentProject()
+                return True
+            return False
+        except Exception:
+            return False
+
+    def ensure(self):
+        """Гарантирует живое соединение."""
+        if not self.ping():
+            log("Переподключение к Resolve...", "warn")
+            return self.connect()
+        return True
+
+    def get_timeline(self):
+        if not self.project:
+            return None
+        try:
+            tl = self.project.GetCurrentTimeline()
+            if not tl:
+                tl = self.project.GetTimelineByIndex(1)
+            if tl:
+                self.project.SetCurrentTimeline(tl)
+            return tl
+        except Exception as e:
+            log("get_timeline: " + str(e), "warn")
+            return None
+
+    def stop_rendering(self):
+        """Реальная остановка рендера в Resolve."""
+        self._rendering = False
+        if not self.project:
+            return False
+        try:
+            self.project.StopRendering()
+            if self._current_job_id:
+                try:
+                    self.project.DeleteRenderJob(self._current_job_id)
+                except Exception:
+                    pass
+                self._current_job_id = None
+            log("StopRendering() выполнен.", "ok")
+            emit("task_done", name="", success=False)
+            return True
+        except Exception as e:
+            log("StopRendering error: " + str(e), "warn")
+            return False
+
+# =============================================================================
+# Обработчики команд
+# =============================================================================
+
+def cmd_get_presets(med, args):
+    if not med.ensure(): return
+    if not med.project:
+        emit("presets_result", user=[], builtin=[], error="Проект не открыт")
+        return
+    try:
+        all_p = med.project.GetRenderPresets()
+        if not all_p:
+            emit("presets_result", user=[], builtin=[], error="Пресеты не найдены")
+            return
+        names = list(all_p.values()) if isinstance(all_p, dict) else list(all_p)
+        KW = ["Master","Default","HyperDeck","YouTube","Vimeo","Twitter",
+              "IMF","Blu-ray","DVD","H.264","H.265","ProRes","DNx","EXR","H264","H265"]
+        user_p    = [n for n in names if not any(k in n for k in KW)]
+        builtin_p = [n for n in names if     any(k in n for k in KW)]
+        emit("presets_result", user=user_p, builtin=builtin_p, error=None)
+        log("Пресетов: {} польз. + {} станд.".format(len(user_p), len(builtin_p)), "ok")
+    except Exception as e:
+        emit("presets_result", user=[], builtin=[], error=str(e))
+
+
+def cmd_sync(med, args):
+    if not med.ensure(): return
+    if not med.project:
+        emit("error", text="Проект не открыт")
+        return
+    tl = med.get_timeline()
+    if not tl:
+        emit("error", text="Таймлайн не найден")
+        return
+    try:
+        tl_start = int(tl.GetStartFrame() or 0)
+        tl_end   = int(tl.GetEndFrame()   or 0)
+        tl_name  = tl.GetName() or "Timeline"
+    except Exception as e:
+        emit("error", text="sync GetFrame: " + str(e))
+        return
+
+    emit("timeline_info", name=tl_name, start=tl_start, end=tl_end)
+    log('Таймлайн: "{}" [{}-{}] {} fr'.format(tl_name, tl_start, tl_end, tl_end-tl_start))
+
+    tasks     = []
+    auto_count = int(args.get("auto_count", 0))
+
+    if auto_count > 0:
+        step = max(1, (tl_end - tl_start) // auto_count)
+        for i in range(auto_count):
+            s = tl_start + i * step
+            e = tl_end if i == auto_count-1 else tl_start + (i+1)*step - 1
+            tasks.append({"name": "Part_{}".format(i+1), "s": s, "e": e, "color": ""})
+            log("  Part_{}: [{}...{}]".format(i+1, s, e), "ok")
+        tasks.append({"name": "Audio_Processing", "s": tl_start, "e": tl_end, "audioOnly": True})
+        emit("sync_result", tasks=tasks)
+        log("=== AUTO: {} сегментов ===".format(len(tasks)), "ok")
+        emit("agent_done", total=len(tasks), completed=len(tasks))
+        return
+
+    # По маркерам
+    markers = None
+    try:
+        markers = tl.GetMarkers()
+    except Exception as e:
+        log("GetMarkers: " + str(e), "warn")
+
+    color_filter = args.get("color", "All")
+    if color_filter == "All":
+        color_filter = None
+
+    if markers and isinstance(markers, dict) and len(markers) >= 2:
+        frames = sorted([int(f) for f in markers.keys() if str(f).lstrip('-').isdigit()])
+        log("Маркеров: {} фреймов: {}".format(len(frames), frames[:8]))
+        for i in range(len(frames)-1):
+            f      = frames[i]
+            m_data = markers.get(f) or markers.get(str(f))
+            if not m_data: continue
+            m_color = m_data.get("color") or m_data.get("Color") or ""
+            m_note  = m_data.get("note")  or m_data.get("Note")  or "Seg_{}".format(i+1)
+            if color_filter and m_color != color_filter: continue
+            tasks.append({"name": str(m_note), "s": frames[i], "e": frames[i+1]-1, "color": m_color})
+            log('  "{}" [{}...{}]'.format(m_note, frames[i], frames[i+1]-1), "ok")
+    else:
+        log("Маркеров нет → Full_Timeline", "warn")
+        tasks.append({"name": "Full_Timeline", "s": tl_start, "e": tl_end})
+
+    tasks.append({"name": "Audio_Processing", "s": tl_start, "e": tl_end, "audioOnly": True})
+    emit("sync_result", tasks=tasks)
+    log("=== Итого: {} сегментов ===".format(len(tasks)), "ok")
+    emit("agent_done", total=len(tasks), completed=len(tasks))
+
+
+def cmd_render(med, args):
+    """Рендер одного сегмента. Блокирующий — выполняется в отдельном потоке."""
+    if not med.ensure(): return
+    if not med.project:
+        emit("error", text="Проект не открыт")
+        return
+
+    name      = args.get("name", "Segment")
+    start     = int(args.get("start", 0))
+    end       = int(args.get("end", 0))
+    preset    = args.get("preset", "")
+    output    = args.get("output", "C:/renders").replace("\\", "/")
+    audio_only= int(args.get("audio_only", 0))
+
+    project = med.project
+    med._rendering = True
+
+    try:
+        try: project.DeleteAllRenderJobs()
+        except Exception: pass
+
+        if preset:
+            ok = project.LoadRenderPreset(preset)
+            if not ok:
+                emit("error", text='Пресет "{}" не найден'.format(preset))
+                med._rendering = False
+                return
+            log('Пресет: "{}"'.format(preset), "ok")
+
+        settings = {
+            "CustomName":      name,
+            "TargetDir":       output,
+            "MarkIn":          start,
+            "MarkOut":         end,
+            "SelectAllFrames": 0,
+        }
+        if audio_only:
+            settings["ExportVideo"] = False
+            settings["ExportAudio"] = True
+
+        project.SetRenderSettings(settings)
+        time.sleep(0.2)
+
+        job_id = project.AddRenderJob()
+        if not job_id:
+            emit("error", text="AddRenderJob вернул None")
+            med._rendering = False
+            return
+
+        med._current_job_id = job_id
+        try: med.pm.SaveProject()
+        except Exception: pass
+
+        emit("task_start", name=name, job_id=str(job_id))
+        project.StartRendering([job_id])
+        log('Рендер: "{}" [{}-{}]'.format(name, start, end), "ok")
+
+    except Exception as e:
+        emit("error", text="render setup: " + str(e))
+        med._rendering = False
+        return
+
+    # Poll
+    POLL = 1.2
+    GRACE = 4
+    empty = 0
+    last_pct = 0.0
+
+    while med._rendering:
+        time.sleep(POLL)
+        if not med._rendering:
+            break
+
+        try:
+            stat_list = project.GetRenderJobList() or []
+        except Exception:
+            empty += 1
+            if empty >= GRACE:
+                emit("task_done", name=name, success=True)
+                log("DONE: {} (список пуст)".format(name), "ok")
+                break
+            continue
+
+        if not stat_list:
+            empty += 1
+            if empty >= GRACE:
+                emit("task_done", name=name, success=True)
+                log("DONE: {} (очередь пуста)".format(name), "ok")
+                break
+            continue
+        empty = 0
+
+        # Ищем наш job
+        job_stat = None
+        for j in stat_list:
+            if not isinstance(j, dict): continue
+            jid = j.get("JobId") or j.get("jobId") or ""
+            if str(jid) == str(job_id):
+                job_stat = j; break
+        if job_stat is None and stat_list:
+            job_stat = stat_list[0] if isinstance(stat_list[0], dict) else None
+        if not job_stat:
+            continue
+
+        # Извлекаем прогресс — два формата Resolve API
+        try:
+            pct    = float(job_stat.get("CompletionPercentage", 0))
+            status = str(job_stat.get("JobStatus", "")).lower()
+            if pct == 0 and isinstance(job_stat.get("JobStatus"), dict):
+                inner  = job_stat["JobStatus"]
+                pct    = float(inner.get("CompletionPercentage", 0))
+                status = str(inner.get("JobStatus", "")).lower()
+        except Exception:
+            pct = last_pct; status = ""
+
+        if pct > last_pct:
+            last_pct = pct
+        emit("progress", name=name, pct=last_pct, status=status)
+
+        if status == "complete" or last_pct >= 100:
+            med._rendering = False
+            med._current_job_id = None
+            emit("task_done", name=name, success=True)
+            log("DONE: {} [100%]".format(name), "ok")
+            try: project.DeleteRenderJob(job_id)
+            except Exception: pass
+            break
+        elif status in ("failed", "cancelled"):
+            med._rendering = False
+            med._current_job_id = None
+            emit("task_done", name=name, success=False)
+            log("FAILED: {}".format(name), "error")
+            try: project.DeleteRenderJob(job_id)
+            except Exception: pass
+            break
+
+    emit("agent_done", total=1, completed=1)
+
+
+def cmd_list_jobs(med, args):
+    if not med.ensure(): return
+    if not med.project:
+        emit("sync_result", tasks=[])
+        return
+    try:
+        tl   = med.get_timeline()
+        tl_s = int(tl.GetStartFrame() or 0) if tl else 0
+        tl_e = int(tl.GetEndFrame()   or 0) if tl else 0
+        jobs  = med.project.GetRenderJobList() or []
+        tasks = []
+        for job in jobs:
+            if isinstance(job, dict):
+                name = job.get("RenderJobName") or job.get("JobId") or "Job"
+                mi   = int(job.get("MarkIn",  tl_s))
+                mo   = int(job.get("MarkOut", tl_e))
+            else:
+                name = str(job); mi = tl_s; mo = tl_e
+            tasks.append({"name": name, "s": mi, "e": mo})
+        emit("sync_result", tasks=tasks)
+        log("Загружено {} заданий.".format(len(tasks)), "ok")
+        emit("agent_done", total=len(tasks), completed=len(tasks))
+    except Exception as e:
+        emit("error", text="list_jobs: " + str(e))
+        emit("sync_result", tasks=[])
+
+
+def cmd_open_project(med, args):
+    if not med.ensure(): return
+    path = args.get("path", "")
+    name = args.get("name", "")
+    try:
+        if path.lower().endswith(".drp"):
+            ok = med.pm.ImportProject(path)
+            if not ok:
+                log("ImportProject вернул False (возможно уже существует)", "warn")
+            ok2 = med.pm.LoadProject(name)
+            if ok2:
+                med.project = med.pm.GetCurrentProject()
+                log('Проект открыт: "{}"'.format(name), "ok")
+                emit("agent_done", total=0, completed=0)
+            else:
+                emit("error", text='Не удалось открыть: "{}"'.format(name))
+        else:
+            ok = med.pm.LoadProject(path or name)
+            if ok:
+                med.project = med.pm.GetCurrentProject()
+                log('Проект загружен: "{}"'.format(path or name), "ok")
+                emit("agent_done", total=0, completed=0)
+            else:
+                emit("error", text='LoadProject failed: "{}"'.format(path))
+    except Exception as e:
+        emit("error", text="open_project: " + str(e))
+
+
+def cmd_close_project(med, args):
+    try:
+        if med.project and med.pm:
+            med.pm.CloseProject(med.project)
+            med.project = None
+            log("Проект закрыт.", "ok")
+        emit("agent_done", total=0, completed=0)
+    except Exception as e:
+        emit("error", text="close_project: " + str(e))
+
+
+def cmd_final_build(med, args):
+    if not med.ensure(): return
+    if not med.project:
+        emit("error", text="Проект не открыт")
+        return
+
+    preset     = args.get("preset", "")
+    target_dir = args.get("output", "").replace("\\", "/")
+    segs_all   = args.get("segments", [])
+
+    segs_video = [s for s in segs_all if not s.get("audioOnly")]
+    segs_audio = [s for s in segs_all if     s.get("audioOnly")]
+
+    if not segs_video:
+        emit("error", text="Нет video-сегментов")
+        return
+    if not target_dir:
+        try:
+            st = med.project.GetRenderSettings()
+            target_dir = (st or {}).get("TargetDir", "")
+        except Exception: pass
+    if not target_dir:
+        emit("error", text="TargetDir не найден")
+        return
+
+    log("=== FINAL BUILD: start ===", "ok")
+    VIDEO_EXT = [".mov",".mp4",".mxf",".avi",".mkv",".tif",".tiff",".exr"]
+    AUDIO_EXT = [".wav",".aif",".aiff",".mp3",".aac",".m4a",".flac"]
+
+    def find_file(directory, base, exts):
+        for ext in exts:
+            p = os.path.join(directory, base + ext)
+            if os.path.exists(p): return p.replace("\\", "/")
+        try:
+            for fname in sorted(os.listdir(directory)):
+                if fname.lower().startswith(base.lower()):
+                    for ext in exts:
+                        if fname.lower().endswith(ext.lower()):
+                            return os.path.join(directory, fname).replace("\\", "/")
+        except Exception: pass
+        return None
+
+    segs_sorted = sorted(segs_video, key=lambda s: int(s.get("s", s.get("start", 0))))
+    video_files = []
+    for seg in segs_sorted:
+        p = find_file(target_dir, safe_name(seg.get("name", "")), VIDEO_EXT)
+        if not p:
+            emit("error", text='Файл не найден: "{}"'.format(seg.get("name", "")))
+            return
+        video_files.append(p)
+        log('OK video: {}'.format(os.path.basename(p)), "ok")
+
+    audio_files = []
+    for seg in segs_audio:
+        p = find_file(target_dir, safe_name(seg.get("name", "")), AUDIO_EXT)
+        if p:
+            audio_files.append(p)
+            log('OK audio: {}'.format(os.path.basename(p)), "ok")
+
+    import datetime
+    stamp   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    tl_name = "Final Build {}".format(stamp)
+    mp      = med.project.GetMediaPool()
+    if not mp:
+        emit("error", text="GetMediaPool вернул None")
+        return
+
+    final_tl = mp.CreateEmptyTimeline(tl_name)
+    if not final_tl:
+        emit("error", text="CreateEmptyTimeline вернул None")
+        return
+
+    log('Таймлайн: "{}"'.format(tl_name), "ok")
+    med.project.SetCurrentTimeline(final_tl)
+    emit("progress", name="final_build", pct=20, status="importing")
+
+    iv = mp.ImportMedia(video_files) or []
+    if not iv:
+        emit("error", text="ImportMedia(video) пустой")
+        return
+    mp.AppendToTimeline(iv)
+    log("Видео: {} клипов".format(len(iv)), "ok")
+
+    if audio_files:
+        try:
+            ia = mp.ImportMedia(audio_files) or []
+            if ia:
+                mp.AppendToTimeline(ia)
+                log("Аудио: {} файлов".format(len(ia)), "ok")
+        except Exception as e:
+            log("Аудио: " + str(e), "warn")
+
+    emit("progress", name="final_build", pct=60, status="verifying")
+
+    try:
+        tl_s = int(final_tl.GetStartFrame() or 0)
+        tl_e = int(final_tl.GetEndFrame()   or 0)
+        sum_s = sum(int(s.get("e",0))-int(s.get("s",0))+1 for s in segs_sorted)
+        diff  = abs(sum_s - (tl_e - tl_s))
+        log("Длительность: TL={} fr, сегменты={} fr, diff={}".format(
+            tl_e-tl_s, sum_s, diff), "ok" if diff<=2 else "warn")
+    except Exception: pass
+
+    emit("progress", name="final_build", pct=75, status="rendering")
+
+    try:
+        if preset: med.project.LoadRenderPreset(preset)
+        try: med.project.DeleteAllRenderJobs()
+        except Exception: pass
+        tl_s2 = int(final_tl.GetStartFrame() or 0)
+        tl_e2 = int(final_tl.GetEndFrame()   or 0)
+        med.project.SetRenderSettings({
+            "MarkIn": tl_s2, "MarkOut": tl_e2,
+            "CustomName": safe_name(tl_name), "SelectAllFrames": 0
+        })
+        job_id = med.project.AddRenderJob()
+        if not job_id:
+            emit("error", text="Final AddRenderJob вернул None")
+            return
+        med._current_job_id = job_id
+        med._rendering = True
+        med.project.StartRendering([job_id])
+        log("Финальный рендер запущен.", "ok")
+        emit("progress", name="final_build", pct=80, status="rendering")
+
+        POLL=2.0; GRACE=4; empty=0
+        while med._rendering:
+            time.sleep(POLL)
+            if not med._rendering: break
+            try:
+                jl = med.project.GetRenderJobList() or []
+                if not jl:
+                    empty += 1
+                    if empty >= GRACE:
+                        emit("task_done", name="final_build", success=True)
+                        log("=== FINAL BUILD: DONE ===", "ok"); break
+                    continue
+                empty = 0
+                js = next((j for j in jl if isinstance(j,dict) and
+                           str(j.get("JobId"))==str(job_id)), jl[0])
+                pct    = float(js.get("CompletionPercentage", 0))
+                status = str(js.get("JobStatus", "")).lower()
+                emit("progress", name="final_build", pct=80+pct*0.2, status=status)
+                if status=="complete" or pct>=100:
+                    emit("task_done", name="final_build", success=True)
+                    log("=== FINAL BUILD: DONE ===", "ok"); break
+                elif status in ("failed","cancelled"):
+                    emit("task_done", name="final_build", success=False)
+                    log("=== FINAL BUILD: FAILED ===", "error"); break
+            except Exception:
+                empty += 1
+                if empty >= GRACE:
+                    emit("task_done", name="final_build", success=True); break
+
+        med._rendering = False
+        med._current_job_id = None
+    except Exception as e:
+        emit("error", text="final_build render: " + str(e))
+
+    emit("agent_done", total=1, completed=1)
+
+# =============================================================================
+# Главный демон-цикл
+# =============================================================================
+def run_daemon(ip):
+    med = ResolveMediator()
+
+    emit("mediator_starting", ip=ip)
+    log("Mediator daemon запускается (ip={})...".format(ip), "info")
+
+    # Подключаемся к Resolve
+    if not med.connect(ip):
+        log("Resolve недоступен при старте. Попробуйте Open Project.", "warn")
+
+    emit("mediator_ready")
+    log("Mediator готов. Жду команды...", "ok")
+
+    # Поток для выполнения рендера (чтобы не блокировать stdin-loop)
+    render_thread = [None]
+
+    while True:
+        try:
+            line = sys.stdin.readline()
+        except Exception:
+            break
+
+        if not line:
+            # EOF — stdin закрыт, выходим
+            break
+
+        line = line.strip()
+        if not line:
+            continue
+
+        try:
+            cmd_obj = json.loads(line)
+        except Exception as e:
+            log("JSON parse error: " + str(e), "warn")
+            continue
+
+        cmd = cmd_obj.get("cmd", "").lower()
+        args = cmd_obj.get("args", {})
+
+        if cmd == "quit":
+            log("Mediator: QUIT получен.", "ok")
+            emit("mediator_stopped")
+            break
+
+        elif cmd == "stop":
+            # Немедленная остановка рендера — выполняется в текущем потоке
+            # med._rendering = False остановит poll-loop в render_thread
+            med.stop_rendering()
+
+        elif cmd == "pause":
+            try:
+                if med.project: med.project.StopRendering()
+                med._rendering = False  # остановит poll
+                emit("paused", name="")
+                log("Пауза.", "warn")
+            except Exception as e:
+                log("pause: " + str(e), "warn")
+
+        elif cmd == "get_presets":
+            cmd_get_presets(med, args)
+
+        elif cmd == "sync":
+            cmd_sync(med, args)
+
+        elif cmd == "list_jobs":
+            cmd_list_jobs(med, args)
+
+        elif cmd == "open_project":
+            cmd_open_project(med, args)
+
+        elif cmd == "close_project":
+            cmd_close_project(med, args)
+
+        elif cmd == "final_build":
+            # Запускаем в отдельном потоке чтобы stdin-loop продолжал работать
+            if render_thread[0] and render_thread[0].is_alive():
+                log("Рендер уже выполняется.", "warn")
+            else:
+                t = threading.Thread(
+                    target=cmd_final_build, args=(med, args), daemon=True)
+                render_thread[0] = t
+                t.start()
+
+        elif cmd == "render":
+            # Запускаем в отдельном потоке
+            if render_thread[0] and render_thread[0].is_alive():
+                log("Рендер уже выполняется.", "warn")
+            else:
+                t = threading.Thread(
+                    target=cmd_render, args=(med, args), daemon=True)
+                render_thread[0] = t
+                t.start()
+
+        elif cmd == "ping":
+            ok = med.ping()
+            emit("pong", connected=ok)
+
+        else:
+            log("Неизвестная команда: {}".format(cmd), "warn")
+
+    log("Mediator daemon завершён.", "ok")
+
+# =============================================================================
+# MAIN — два режима запуска:
+#   1. --mode=daemon  (по умолчанию) — постоянный демон
+#   2. --mode=oneshot + команда — одиночный вызов (для обратной совместимости)
+# =============================================================================
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode",       default="daemon")
+    parser.add_argument("--ip",         default="127.0.0.1")
+    # Oneshot аргументы (обратная совместимость)
+    parser.add_argument("--preset",     default="")
+    parser.add_argument("--output",     default="C:/renders")
+    parser.add_argument("--name",       default="Segment")
+    parser.add_argument("--start",      type=int, default=0)
+    parser.add_argument("--end",        type=int, default=0)
+    parser.add_argument("--audio_only", type=int, default=0)
+    parser.add_argument("--color",      default="All")
+    parser.add_argument("--auto_count", type=int, default=0)
+    args = parser.parse_args()
+
+    if args.mode == "daemon":
+        run_daemon(args.ip)
+    else:
+        # Oneshot — оборачиваем в daemon команду для совместимости
+        med = ResolveMediator()
+        if not med.connect(args.ip):
+            sys.exit(1)
+        if args.mode == "get_presets":
+            cmd_get_presets(med, {})
+        elif args.mode == "sync":
+            cmd_sync(med, {"auto_count": args.auto_count, "color": args.color})
+        elif args.mode == "render":
+            cmd_render(med, {"name": args.name, "start": args.start, "end": args.end,
+                             "preset": args.preset, "output": args.output,
+                             "audio_only": args.audio_only})
+        elif args.mode == "list_jobs":
+            cmd_list_jobs(med, {})
+        elif args.mode == "open_project":
+            cmd_open_project(med, {"path": args.output, "name": args.name})
+        elif args.mode == "close_project":
+            cmd_close_project(med, {})
+
+if __name__ == "__main__":
+    main()
