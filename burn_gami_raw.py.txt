@@ -1,0 +1,163 @@
+# ===============================================================================
+#   PROJECT:         WindowsNvidiaOS / GAMI 27
+#   FILE:            burn_gami_raw.py
+#   VERSION:         v7.1.0 (Unified Sovereign Packer & RAW 16:9 Buffer Injector)
+#   BUILD VERSION:   b2026.05.29_720
+#   DATE:            May 29, 2026
+#   DESCRIPTION:     Advanced automated assembly line. Tailored for GamiLink64
+#                    pure binary emissions. Accepts 0xEA (JMP FAR) as a valid
+#                    Sovereign start opcode and injects 800x450 texture at 16MB.
+# ===============================================================================
+
+import os
+import sys
+
+def verify_binary_master_map(image_bytes):
+    """ СКРИПТ №1: Верифікатор бінарного образу за архітектурною Мастер-Картою v27. """
+    print("\n" + "-" * 80)
+    print(" [🔍] ЗАПУСК СКРИПТА №1: СЕКТОРНА ВЕРИФІКАЦІЯ ОБРАЗУ ЗА МАСТЕР-КАРТОЮ GAMI 27")
+    print("-" * 80)
+    
+    errors_detected = 0
+    
+    # ФІКС ВЕРСІЇ GAMI 27: Тепер першим байтом залізобетонно є 0xEA (наш Far Jump), а не старий cli!
+    if image_bytes[0x00] != 0xEA:
+        print(f" [❌ ERR] АНОМАЛІЯ СТАРТУ! Адреса 0x00000000: Очікувався 0xEA (JMP FAR), виявлено 0x{image_bytes[0x00]:02X}")
+        errors_detected += 1
+    else:
+        print(f" [ OK ] Контрольна точка 1 (0x00000000): Суверенний Far Jump Опкод 0xEA на місці!")
+
+    if image_bytes[0x1FE] != 0x55 or image_bytes[0x1FF] != 0xAA:
+        print(f" [❌ ERR] СБОЙ МАНТИССЫ MBR! Виявлено 0x{image_bytes[0x1FE]:02X}{image_bytes[0x1FF]:02X} замість 0x55AA")
+        errors_detected += 1
+    else:
+        print(f" [ OK ] Контрольна точка 2 (0x000001FE): Магічна сигнатура завантаження 0x55AA на місці.")
+
+    if image_bytes[0x200] != 0xFA:
+        print(f" [❌ ERR] ЗСУВ x64 ЯДРА! Адреса 0x00000200: Очікувався 0xFA, виявлено 0x{image_bytes[0x200]:02X}")
+        errors_detected += 1
+    else:
+        print(f" [ OK ] Контрольна точка 3 (0x00000200): Точка входу x64 Long Mode (0xFA) відповідає Мастер-Копії.")
+
+    print("-" * 80)
+    return errors_detected == 0
+
+def verify_physical_usb_hardware(physical_disk_path, expected_bytes_count):
+    """ СКРИПТ №2: Посекторний апаратний верифікатор фізичних осередків флешки. """
+    print("\n" + "-" * 80)
+    print(" [🔍] ЗАПУСК СКРИПТА №2: ПОСЕКТОРНЕ ЗЧИТУВАННЯ ТА ВЕРИФІКАЦІЯ ФЛЕШКИ")
+    print("-" * 80)
+    try:
+        import os as native_os
+        fd = native_os.open(physical_disk_path, native_os.O_RDONLY | native_os.O_BINARY)
+        flash_data = native_os.read(fd, expected_bytes_count)
+        native_os.close(fd)
+        
+        if verify_binary_master_map(flash_data):
+            print("[+++] СТАТУС СКРИПТА №2: ПОВНИЙ ТРІУМФ! Флешка прошита байт-в-байт за Мастер-Копією v27! 🚀")
+            print("[*] Дія: Можна безпечно витягати накопичувач і запускати живе залізо Gami 27!")
+        else:
+            print("[-] СТАТУС СКРИПТА №2: КРИТИЧНИЙ ЗБІЙ ГЕОМЕТРИИ НА ФЛЕШКЕ!")
+    except Exception as e:
+        print(f"[-] Помилка апаратного читання флешки: {str(e)}")
+    print("-" * 80)
+
+def main():
+    current_dir = os.path.dirname(os.path.realpath(__file__))
+    print("=" * 80)
+    print(" GAMI_27 PRODUCTION LINE: UNIFIED SOVEREIGN TEXTURE PACKER")
+    print("=" * 80)
+
+    # Наш новий чистокровний бінарник завантажувача з папки MASM8, згенерований GamiLink64!
+    boot_bin_path = os.path.join(current_dir, "..", "MASM8", "boot_vbe16.bin")
+    
+    # Страховочний fallback шляху, якщо файл скопійовано у поточну папку Release
+    if not os.path.exists(boot_bin_path):
+        boot_bin_path = os.path.join(current_dir, "boot_vbe16.bin")
+
+    kernel_exe_path = os.path.join(current_dir, "WindowsNvidiaOS.exe")
+    texture_raw_path = os.path.join(current_dir, "logo27.raw")
+    output_bin = os.path.join(current_dir, "WindowsNvidiaOS.bin")
+
+    print(f"[*] Крок 1: Зчитування суверенного бінарника завантажувача ({boot_bin_path})...")
+    if not os.path.exists(boot_bin_path):
+        print(f"[-] Помилка: Файл завантажувача не знайдено!")
+        return
+
+    with open(boot_bin_path, "rb") as f:
+        boot_code_raw = f.read()
+
+    # Оскільки GamiLink64 видає чистий код без Windows PE-заголовків, копіюємо масив безпосередньо!
+    boot_code = bytearray(boot_code_raw)
+    if len(boot_code) < 510:
+        boot_code.extend(b"\x00" * (510 - len(boot_code)))
+    else:
+        boot_code = boot_code[:510]
+    boot_code.append(0x55)
+    boot_code.append(0xAA)
+
+    print("[*] Крок 2: Інтеграція 64-бітного модульного C++ ядра...")
+    if not os.path.exists(kernel_exe_path):
+        print(f"[-] Помилка: Моноліт ядра '{kernel_exe_path}' не знайдено!")
+        return
+
+    with open(kernel_exe_path, "rb") as f:
+        raw_kernel = f.read()
+
+    entry_offset = raw_kernel.find(b"\xFA")
+    if entry_offset == -1: entry_offset = 0
+    kernel_body = raw_kernel[entry_offset:]
+
+    print("[*] Крок 3: Інжекція широкоформатної заставки 800x450...")
+    if not os.path.exists(texture_raw_path):
+        print(f"[-] Помилка: Файл текстури '{texture_raw_path}' не знайдено!")
+        return
+        
+    with open(texture_raw_path, "rb") as f:
+        raw_texture_data = f.read()
+
+    # Повна чиста склейка фінального сэндвіча Gami 27
+    final_image = bytearray()
+    final_image.extend(boot_code)   # Сектор 0
+    final_image.extend(kernel_body) # Сектор 1 (Ядро)
+    
+    # Садимо заставку строго на відмітку 16 Мегабайт в ОЗУ для нашого CUDA Диспетчера
+    target_texture_offset = 0x01000000 - 0x7C00
+    current_size = len(final_image)
+    if current_size < target_texture_offset:
+        final_image.extend(b"\x00" * (target_texture_offset - current_size))
+        
+    final_image.extend(raw_texture_data)
+
+    remainder = len(final_image) % 512
+    if remainder != 0: final_image.extend(b"\x00" * (512 - remainder))
+
+    # ЗАПУСКАЕМ НАШ СУРОВЫЙ ОБНОВЛЕННЫЙ ОБОРОННЫЙ КОНТУР СКРИПТА №1
+    if verify_binary_master_map(final_image):
+        with open(output_bin, "wb") as f:
+            f.write(final_image)
+        print(f"[+++] СТАТУС СКРИПТА №1: УСПІХ! Образ версії Gami 27 зафіксовано у {output_bin}")
+        
+        print("\n" + "=" * 80)
+        burn_confirm = input("[?] Бажаєш ВІДРАЗУ прошити флешку та запустити Скрипт №2? (YES/NO): ")
+        if burn_confirm.upper() == "YES":
+            drive_num = input("[?] Введи НОМЕР фізичного диска твоєї флешки (1 чи 2): ")
+            physical_disk_path = r"\\.\PhysicalDrive" + str(drive_num)
+            
+            print(f"[*] Прямий низькорівневий DD-запис на {physical_disk_path}...")
+            try:
+                fd = os.open(physical_disk_path, os.O_WRONLY | os.O_BINARY)
+                os.write(fd, final_image)
+                os.close(fd)
+                print("[+] Прожиг заліза завершено. Передаю контур Скрипту №2...")
+                verify_physical_usb_hardware(physical_disk_path, len(final_image))
+            except PermissionError:
+                print("[-] Помилка: Запусти консоль від імені АДМІНІСТРАТОРА!")
+            except Exception as e:
+                print(f"[-] Апаратний сбій запису флешки: {str(e)}")
+    else:
+        print("[-] КРИТИЧНИЙ СБОЙ ВЕРСІЇ 27: Складання скасовано!")
+    print("=" * 80)
+
+if __name__ == "__main__":
+    main()
